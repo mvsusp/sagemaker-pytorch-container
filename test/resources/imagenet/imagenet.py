@@ -18,15 +18,15 @@ import torchvision.models as models
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-best_prec1 = 0
-
 
 def _load_hyperparameters(hyperparameters):
     logger.info("Load hyperparameters")
+    # model architecture (default: resnet50)'
+    arch = hyperparameters.get('arch', 'resnet50')
     # number of data loading workers (default: 4)
     workers = hyperparameters.get('workers', 4)
-    # number of total epochs to run (default: 90)
-    epochs = hyperparameters.get('epochs', 90)
+    # number of total epochs to run (default: 3)
+    epochs = hyperparameters.get('epochs', 3)
     # manual epoch number (useful on restarts) (default: 0)
     start_epoch = hyperparameters.get('start_epoch', 0)
     # mini_batch size (default: 256)
@@ -42,29 +42,30 @@ def _load_hyperparameters(hyperparameters):
     # path to latest checkpoint (default: none)
     resume = hyperparameters.get('resume', '')
     # evaluate model on validation set
-    evaluate = hyperparameters.get('evaluate', True)
+    evaluate = hyperparameters.get('evaluate', False)
+    # use pre-trained model (default: False)
+    pretrained = hyperparameters.get('pretrained', False)
     # number of distributed processes
     world_size = hyperparameters.get('world_size', 1)
-    # url used to set up distributed training
-    dist_url = hyperparameters.get('dist_url', 'tcp://224.66.41.62:23456')
     # distributed backend
     backend = hyperparameters.get('dist_backend', 'gloo')
 
     logger.info(
-        'workers: {}, epochs: {}, start_epoch: {}, '.format(workers, epochs, start_epoch) +
+        'arch: {}, workers: {}, epochs: {}, start_epoch: {}, '.format(arch, workers, epochs,
+                                                                      start_epoch) +
         'batch_size: {}, lr: {}, momentum: {}, '.format(batch_size, lr, momentum) +
         'weight_decay: {}, print_freq: {}, resume: {}, '.format(weight_decay, print_freq, resume) +
-        'evaluate: {}, world_size: {}, dist_url: {}, backend: {}'.format(evaluate, world_size,
-                                                                         dist_url, backend)
+        'evaluate: {}, pretrained: {}, world_size: {}, '.format(evaluate, pretrained, world_size) +
+        'backend: {}'.format(backend)
     )
-    return workers, epochs, start_epoch, batch_size, lr, momentum, weight_decay, print_freq, \
-           evaluate, resume, world_size, dist_url, backend
+    return arch, workers, epochs, start_epoch, batch_size, lr, momentum, weight_decay, print_freq, \
+           evaluate, resume, pretrained, world_size, backend
 
 
-def _get_train_data_loader(batch_size, training_dir, train_sampler, workers):
+def _get_train_data_loader(batch_size, train_dataset, train_sampler, workers):
     logger.info("Get train data loader")
     return torch.utils.data.DataLoader(
-        training_dir, batch_size=batch_size, shuffle=(train_sampler is None),
+        train_dataset, batch_size=batch_size, shuffle=(train_sampler is None),
         num_workers=workers, pin_memory=True, sampler=train_sampler)
 
 
@@ -81,7 +82,7 @@ def _get_val_data_loader(batch_size, val_dir, normalize, workers):
         num_workers=workers, pin_memory=True)
 
 
-def _validate(val_loader, model, criterion, print_freq):
+def _validate(val_loader, model, criterion, print_freq, cuda):
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
@@ -92,7 +93,8 @@ def _validate(val_loader, model, criterion, print_freq):
 
     end = time.time()
     for i, (input, target) in enumerate(val_loader):
-        target = target.cuda(async=True)
+        if cuda:
+            target = target.cuda(async=True)
         input_var = torch.autograd.Variable(input, volatile=True)
         target_var = torch.autograd.Variable(target, volatile=True)
 
@@ -126,6 +128,7 @@ def _validate(val_loader, model, criterion, print_freq):
 
 
 def _save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+    logger.debug('Saving checkpoint')
     torch.save(state, filename)
     if is_best:
         shutil.copyfile(filename, 'model_best.pth.tar')
@@ -154,7 +157,7 @@ def _accuracy(output, target, topk=(1,)):
     return res
 
 
-class AverageMeter(object):
+class AverageMeter:
     """Computes and stores the average and current value"""
 
     def __init__(self):
@@ -176,16 +179,18 @@ class AverageMeter(object):
 def train(channel_input_dirs, num_gpus, hosts, host_rank, master_addr, master_port,
           hyperparameters):
     training_dir = channel_input_dirs['training']
-    val_dir = channel_input_dirs['validation']
+    val_dir = channel_input_dirs['training']
 
-    workers, epochs, start_epoch, batch_size, lr, momentum, weight_decay, print_freq, resume, \
-    evaluate, world_size, dist_url, backend = _load_hyperparameters(hyperparameters)
+    best_prec1 = 0
+    arch, workers, epochs, start_epoch, batch_size, lr, momentum, weight_decay, \
+    print_freq, resume, evaluate, pretrained, world_size, backend = \
+        _load_hyperparameters(hyperparameters)
 
     is_distributed = len(hosts) > 1 and backend is not None
     logger.debug("Distributed training - {}".format(is_distributed))
+
     cuda = num_gpus > 0
     logger.debug("Number of gpus available - {}".format(num_gpus))
-    kwargs = {'num_workers': 1, 'pin_memory': True} if cuda else {}
 
     if is_distributed:
         # Initialize the distributed environment.
@@ -200,21 +205,28 @@ def train(channel_input_dirs, num_gpus, hosts, host_rank, master_addr, master_po
             dist.get_world_size()) + 'Current host rank is {}. Using cuda: {}. Number of gpus: {}'.format(
             dist.get_rank(), torch.cuda.is_available(), num_gpus))
 
-    # create model
-    model = models.resnet50()
+    if pretrained:
+        logger.debug("=> using pre-trained model '{}'".format(arch))
+        model = models.__dict__[arch](pretrained=True)
+    else:
+        logger.debug("=> creating model '{}'".format(arch))
+        model = models.__dict__[arch]()
 
+    # https://github.com/pytorch/examples/blob/master/imagenet/main.py#L80
     if is_distributed and cuda:
         # multi-machine multi-gpu case
         logger.debug("Multi-machine multi-gpu: using DistributedDataParallel.")
         model = torch.nn.parallel.DistributedDataParallel(model.cuda())
+
     elif cuda:
         # single-machine multi-gpu case
         logger.debug("Single-machine multi-gpu: using DataParallel().cuda().")
         model = torch.nn.DataParallel(model.cuda()).cuda()
+
     else:
         # single-machine or multi-machine cpu case
         logger.debug("Single-machine/multi-machine cpu: using DataParallel.")
-        model = torch.nn.DataParallel(model).cuda()
+        model = torch.nn.DataParallel(model)
 
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
@@ -224,6 +236,7 @@ def train(channel_input_dirs, num_gpus, hosts, host_rank, master_addr, master_po
                                 weight_decay=weight_decay)
 
     if resume:
+        logger.debug('Resuming from checkpoint')
         if os.path.isfile(resume):
             print("=> loading checkpoint '{}'".format(resume))
             checkpoint = torch.load(resume)
@@ -236,7 +249,9 @@ def train(channel_input_dirs, num_gpus, hosts, host_rank, master_addr, master_po
         else:
             print("=> no checkpoint found at '{}'".format(resume))
 
-    cudnn.benchmark = True
+    if cuda:
+        cudnn.benchmark = True
+
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
@@ -254,17 +269,18 @@ def train(channel_input_dirs, num_gpus, hosts, host_rank, master_addr, master_po
     else:
         train_sampler = None
 
-    train_loader = _get_train_data_loader(batch_size, training_dir, train_sampler, workers)
+    train_loader = _get_train_data_loader(batch_size, train_dataset, train_sampler, workers)
     val_loader = _get_val_data_loader(batch_size, val_dir, normalize, workers)
 
     if evaluate:
-        _validate(val_loader, model, criterion, print_freq)
+        _validate(val_loader, model, criterion, print_freq, cuda)
         return
 
     for epochs in range(start_epoch, epochs):
+        logger.debug("Training. Epoch: {}".format(epochs))
         if is_distributed:
             train_sampler.set_epoch(epochs)
-        _adjust_learning_rate(optimizer, epochs)
+        _adjust_learning_rate(optimizer, epochs, lr)
 
         # train for one epoch
         batch_time = AverageMeter()
@@ -276,12 +292,13 @@ def train(channel_input_dirs, num_gpus, hosts, host_rank, master_addr, master_po
         model.train()
 
         end = time.time()
-        for i, (input, target) in enumerate(train_loader):
+        for i, (inputs, target) in enumerate(train_loader):
             # measure data loading time
             data_time.update(time.time() - end)
 
-            target = target.cuda(async=True)
-            input_var = torch.autograd.Variable(input)
+            if cuda:
+                target = target.cuda(async=True)
+            input_var = torch.autograd.Variable(inputs)
             target_var = torch.autograd.Variable(target)
 
             # compute output
@@ -290,9 +307,9 @@ def train(channel_input_dirs, num_gpus, hosts, host_rank, master_addr, master_po
 
             # measure accuracy and record loss
             prec1, prec5 = _accuracy(output.data, target, topk=(1, 5))
-            losses.update(loss.data[0], input.size(0))
-            top1.update(prec1[0], input.size(0))
-            top5.update(prec5[0], input.size(0))
+            losses.update(loss.data[0], inputs.size(0))
+            top1.update(prec1[0], inputs.size(0))
+            top5.update(prec5[0], inputs.size(0))
 
             # compute gradient and do SGD step
             optimizer.zero_grad()
@@ -314,7 +331,8 @@ def train(channel_input_dirs, num_gpus, hosts, host_rank, master_addr, master_po
                     data_time=data_time, loss=losses, top1=top1, top5=top5))
 
         # evaluate on validation set
-        prec1 = _validate(val_loader, model, criterion, print_freq)
+        logger.debug('Evaluating on validation set')
+        prec1 = _validate(val_loader, model, criterion, print_freq, cuda)
 
         # remember best prec@1 and save checkpoint
         is_best = prec1 > best_prec1
@@ -327,10 +345,4 @@ def train(channel_input_dirs, num_gpus, hosts, host_rank, master_addr, master_po
             'optimizer': optimizer.state_dict(),
         }, is_best)
 
-
-def test(model, test_loader, cuda):
-    return
-
-
-def model_fn(model_dir):
-    return
+    return model
